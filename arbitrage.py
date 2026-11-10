@@ -86,13 +86,20 @@ def build_pairs_signals(
     return df
 
 
-def backtest_pairs(signals_df: pd.DataFrame, initial_capital: float = 100_000.0):
+def backtest_pairs(
+    signals_df: pd.DataFrame,
+    initial_capital: float = 100_000.0,
+    cost_bps: float = 5.0,
+):
     """Daily backtest of the spread position.
 
     The signal is computed at day t's close and the position is put on at
     day t+1's close, so it first earns the day t+1 -> t+2 move. Returns are
     measured on gross exposure: one unit is long 1 share of X and short beta
     shares of Y, so capital at risk is X + |beta| * Y.
+
+    cost_bps is charged on gross exposure traded. Opening or closing a
+    position costs cost_bps; flipping straight from long to short costs twice.
     """
     if signals_df.empty:
         raise ValueError("signals_df is empty")
@@ -104,17 +111,63 @@ def backtest_pairs(signals_df: pd.DataFrame, initial_capital: float = 100_000.0)
     spread_change = df["Price_X"].diff() - beta * df["Price_Y"].diff()
     gross = (df["Price_X"] + abs(beta) * df["Price_Y"]).shift(1)
     df["SpreadRet"] = (spread_change / gross).fillna(0.0)
-    df["StrategyRet"] = df["Position"].shift(1).fillna(0) * df["SpreadRet"]
+    df["Cost"] = df["Position"].diff().abs().fillna(df["Position"].abs()) * cost_bps / 10_000
+    df["StrategyRet"] = df["Position"].shift(1).fillna(0) * df["SpreadRet"] - df["Cost"]
 
     df["Equity"] = initial_capital * (1 + df["StrategyRet"]).cumprod()
     df["Drawdown"] = df["Equity"] / df["Equity"].cummax() - 1
 
+    trades = extract_trades(df, cost_bps)
+    closed = trades[~trades["open"]] if not trades.empty else trades
     metrics = {
         "total_return": float(df["Equity"].iloc[-1] / initial_capital - 1),
         "annualized_sharpe": _annualized_sharpe(df["StrategyRet"]),
         "max_drawdown": float(df["Drawdown"].min()),
+        "trades": int(len(closed)),
+        "win_rate": float((closed["return"] > 0).mean()) if len(closed) else float("nan"),
+        "avg_holding_days": float(closed["days"].mean()) if len(closed) else float("nan"),
+        "exposure": float((df["Position"] != 0).mean()),
     }
-    return df, metrics
+    return df, metrics, trades
+
+
+def extract_trades(bt: pd.DataFrame, cost_bps: float) -> pd.DataFrame:
+    """One row per round trip with its net return.
+
+    A position opened at close i earns the spread moves of days i+1..j and is
+    closed at close j. Net return = (1 - c) * prod(1 + side * move) * (1 - c) - 1,
+    with c = cost_bps. Open trades are marked to the last close and only pay
+    the entry cost.
+    """
+    pos = bt["Position"].to_numpy()
+    moves = bt["SpreadRet"].to_numpy()
+    c = cost_bps / 10_000
+    rows = []
+    entry = None
+    for i in range(len(pos)):
+        prev = pos[i - 1] if i else 0
+        if prev != 0 and pos[i] != prev:
+            growth = np.prod(1 + prev * moves[entry + 1:i + 1])
+            rows.append(_trade_row(bt, entry, i, prev, (1 - c) * growth * (1 - c) - 1, False))
+            entry = None
+        if pos[i] != 0 and pos[i] != prev:
+            entry = i
+    if entry is not None:
+        side = pos[entry]
+        growth = np.prod(1 + side * moves[entry + 1:])
+        rows.append(_trade_row(bt, entry, len(pos) - 1, side, (1 - c) * growth - 1, True))
+    return pd.DataFrame(rows, columns=["entry", "exit", "side", "days", "return", "open"])
+
+
+def _trade_row(bt, start, end, side, ret, is_open):
+    return {
+        "entry": bt.index[start],
+        "exit": bt.index[end],
+        "side": "long spread" if side > 0 else "short spread",
+        "days": end - start,
+        "return": float(ret),
+        "open": is_open,
+    }
 
 
 def _annualized_sharpe(returns: pd.Series) -> float:
